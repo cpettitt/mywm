@@ -1,0 +1,9 @@
+﻿---
+BasedOnStyle: Google
+ContinuationIndentWidth: '4'
+IndentWidth: '4'
+TabWidth: '4'
+ColumnLimit: 0
+AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: true
+...
