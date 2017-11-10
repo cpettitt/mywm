@@ -12,8 +12,12 @@
 #include <xcb/xcb.h>
 
 static FILE *log;
-xcb_connection_t *conn;
-static bool restart = false;
+
+const uint32_t WM_STATE_FLAG_RESTART = 0x00000001;
+struct WMState {
+    xcb_connection_t *conn;
+    uint32_t          flags;
+};
 
 void write_log(const char *fmt, ...) {
     va_list ap;
@@ -23,13 +27,17 @@ void write_log(const char *fmt, ...) {
     va_end(ap);
 }
 
+WMState *get_wm_state(struct ev_loop *l) {
+    return (WMState *)ev_userdata(l);
+}
+
 void handle_sighup(struct ev_loop *l, ev_signal *w, int revents) {
     write_log("Got SIGHUP. Setting restart flag.\n");
-    restart = true;
+    get_wm_state(l)->flags |= WM_STATE_FLAG_RESTART;
     ev_break(l, EVBREAK_ALL);
 }
 
-void handle_xcb_configure_request(xcb_configure_request_event_t *ev) {
+void handle_xcb_configure_request(struct ev_loop *l, xcb_configure_request_event_t *ev) {
     uint16_t mask = ev->value_mask;
     uint32_t values[8];
     uint8_t i = 0;
@@ -74,13 +82,15 @@ void handle_xcb_configure_request(xcb_configure_request_event_t *ev) {
         values[i++] = ev->x;
     }
 
-    xcb_configure_window(conn, ev->window, ev->value_mask, values);
+    xcb_configure_window(get_wm_state(l)->conn, ev->window, ev->value_mask, values);
 }
 
-void handle_xcb_map_request(xcb_map_request_event_t * ev) {
+void handle_xcb_map_request(struct ev_loop *l, xcb_map_request_event_t * ev) {
     uint32_t values[] = {
         XCB_EVENT_MASK_ENTER_WINDOW
     };
+
+    xcb_connection_t *conn = get_wm_state(l)->conn;
 
     // TODO: check result
     xcb_change_window_attributes_checked(conn, ev->window, XCB_CW_EVENT_MASK, values);
@@ -88,6 +98,9 @@ void handle_xcb_map_request(xcb_map_request_event_t * ev) {
     xcb_change_save_set(conn, XCB_SET_MODE_INSERT, ev->window);
 
     xcb_map_window(conn, ev->window);
+
+    // TODO: do we need to do this?
+    xcb_set_input_focus(conn, XCB_INPUT_FOCUS_POINTER_ROOT, ev->window, XCB_CURRENT_TIME);
 }
 
 void handle_xcb_button_press(struct ev_loop *l, xcb_button_press_event_t *ev) {
@@ -104,13 +117,7 @@ void handle_xcb_button_press(struct ev_loop *l, xcb_button_press_event_t *ev) {
         write_log("Ignoring " #EVENT " event.\n"); \
         break;
 
-#define DISPATCH_XCB_EVENT(EVENT, TYPE, HANDLER)      \
-    case EVENT:                                       \
-        write_log("Dispatching " #EVENT " event.\n"); \
-        HANDLER((TYPE *)ev);                          \
-        break;
-
-#define DISPATCH_XCB_EVENT_WITH_LOOP(EVENT, TYPE, HANDLER) \
+#define DISPATCH_XCB_EVENT(EVENT, TYPE, HANDLER) \
     case EVENT:                                            \
         write_log("Dispatching " #EVENT " event.\n");      \
         HANDLER(l, (TYPE *)ev);                            \
@@ -122,7 +129,7 @@ void handle_xcb_event(struct ev_loop *l, int type, xcb_generic_event_t *ev) {
         IGNORE_XCB_EVENT(XCB_KEY_PRESS)
         IGNORE_XCB_EVENT(XCB_KEY_RELEASE)
 
-        DISPATCH_XCB_EVENT_WITH_LOOP(XCB_BUTTON_PRESS, xcb_button_press_event_t, handle_xcb_button_press)
+        DISPATCH_XCB_EVENT(XCB_BUTTON_PRESS, xcb_button_press_event_t, handle_xcb_button_press)
 
         IGNORE_XCB_EVENT(XCB_BUTTON_RELEASE)
         IGNORE_XCB_EVENT(XCB_MOTION_NOTIFY)
@@ -168,6 +175,7 @@ void handle_xcb_event(struct ev_loop *l, int type, xcb_generic_event_t *ev) {
 void handle_xcb_socket_read(struct ev_loop *l, ev_io *w, int revents) {
     write_log("Draining xcb events.\n");
 
+    xcb_connection_t *   conn = get_wm_state(l)->conn;
     xcb_generic_event_t *event;
 
     while ((event = xcb_poll_for_event(conn))) {
@@ -201,7 +209,8 @@ int main(int argc, char *argv[]) {
         ev_signal_start(loop, &sighup_watcher);
     }
 
-    ev_io xcb_read_watcher;
+    xcb_connection_t *conn;
+
     { // Install XCB event handler
         int screen_num = 0;
         conn           = xcb_connect(nullptr, &screen_num);
@@ -239,12 +248,15 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        ev_io xcb_read_watcher;
         ev_io_init(&xcb_read_watcher, handle_xcb_socket_read, xcb_get_file_descriptor(conn), EV_READ);
         ev_io_start(loop, &xcb_read_watcher);
     }
 
     write_log("Entering event loop.\n");
 
+    WMState state = {conn, 0};
+    ev_set_userdata(loop, &state);
     ev_run(loop, 0);
 
     write_log("Leaving event loop.\n");
@@ -252,10 +264,10 @@ int main(int argc, char *argv[]) {
     ev_loop_destroy(loop);
     xcb_disconnect(conn);
 
-    if (restart) {
+    if (state.flags & WM_STATE_FLAG_RESTART) {
         write_log("Attempting restart\n");
 
-        execvp(argv[0], nullptr);
+        execvp(argv[0], argv);
         write_log("Failed to restart process: %s\n", strerror(errno));
         return 1;
     }
