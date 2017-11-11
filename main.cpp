@@ -11,12 +11,24 @@
 #include <ev.h>
 #include <xcb/xcb.h>
 
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+
 static FILE *log;
 
-const uint32_t WM_STATE_FLAG_RESTART = 0x00000001;
+const uint32_t WM_STATE_FLAG_RESTART     = 0x00000001;
+const uint32_t WM_STATE_FLAG_MOVE_WINDOW = 0x00000002;
 struct WMState {
     xcb_connection_t *conn;
+    xcb_screen_t *    screen;
     uint32_t          flags;
+
+    // Used on move event
+    int16_t start_x;
+    int16_t start_y;
+
+    int16_t win_origin_x;
+    int16_t win_origin_y;
 };
 
 void write_log(const char *fmt, ...) {
@@ -38,6 +50,9 @@ void handle_sighup(struct ev_loop *l, ev_signal *w, int revents) {
 }
 
 void handle_xcb_configure_request(struct ev_loop *l, xcb_configure_request_event_t *ev) {
+    WMState *wm_state = get_wm_state(l);
+    xcb_connection_t *conn = wm_state->conn;
+    xcb_screen_t *screen = wm_state->screen;
     uint16_t mask = ev->value_mask;
     uint32_t values[8];
     uint8_t i = 0;
@@ -82,7 +97,7 @@ void handle_xcb_configure_request(struct ev_loop *l, xcb_configure_request_event
         values[i++] = ev->x;
     }
 
-    xcb_configure_window(get_wm_state(l)->conn, ev->window, ev->value_mask, values);
+    xcb_configure_window(conn, ev->window, ev->value_mask, values);
 }
 
 void handle_xcb_map_request(struct ev_loop *l, xcb_map_request_event_t * ev) {
@@ -104,12 +119,89 @@ void handle_xcb_map_request(struct ev_loop *l, xcb_map_request_event_t * ev) {
 }
 
 void handle_xcb_button_press(struct ev_loop *l, xcb_button_press_event_t *ev) {
+    WMState *wm_state = get_wm_state(l);
     switch (ev->detail) {
-        case XCB_BUTTON_INDEX_3:
-            write_log("Got button 3.\n");
-            ev_break(l, EVBREAK_ALL);
+        case XCB_BUTTON_INDEX_1:
+            if (ev->state == XCB_MOD_MASK_4) {
+                if (!ev->child) {
+                    // If we got an event on the root window, ignore.
+                    return;
+                }
+
+                xcb_query_pointer_cookie_t pointer_cookie = xcb_query_pointer(wm_state->conn, ev->root);
+                xcb_query_pointer_reply_t *pointer = xcb_query_pointer_reply(wm_state->conn, pointer_cookie, nullptr);
+
+                if (!pointer) {
+                    return;
+                }
+
+                wm_state->start_x = pointer->root_x;
+                wm_state->start_y = pointer->root_y;
+                free(pointer);
+
+                xcb_get_geometry_cookie_t geometry_cookie = xcb_get_geometry(wm_state->conn, ev->child);
+                xcb_get_geometry_reply_t *geometry        = xcb_get_geometry_reply(wm_state->conn, geometry_cookie, nullptr);
+
+                if (!geometry) {
+                    return;
+                }
+
+                wm_state->win_origin_x = geometry->x;
+                wm_state->win_origin_y = geometry->y;
+
+                free(geometry);
+
+                xcb_grab_pointer_cookie_t grab_cookie = xcb_grab_pointer(
+                    wm_state->conn,
+                    0,
+                    wm_state->screen->root,
+                    XCB_EVENT_MASK_BUTTON_MOTION | XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_BUTTON_RELEASE,
+                    XCB_GRAB_MODE_ASYNC,
+                    XCB_GRAB_MODE_ASYNC,
+                    XCB_NONE,
+                    XCB_NONE, // TODO: change cursor
+                    XCB_CURRENT_TIME);
+                xcb_grab_pointer_reply_t *grab = xcb_grab_pointer_reply(wm_state->conn, grab_cookie, nullptr);
+
+                if (grab->status != XCB_GRAB_STATUS_SUCCESS) {
+                    free(grab);
+                    return;
+                }
+                free(grab);
+
+                wm_state->flags |= WM_STATE_FLAG_MOVE_WINDOW;
+                write_log("Setting window move state.\n");
+            }
             break;
     }
+}
+
+void handle_xcb_button_release(struct ev_loop *l, xcb_button_release_event_t *ev) {
+    WMState *wm_state = get_wm_state(l);
+    switch (ev->detail) {
+        case XCB_BUTTON_INDEX_1:
+            if (wm_state->flags & WM_STATE_FLAG_MOVE_WINDOW) {
+                xcb_ungrab_pointer(wm_state->conn, XCB_CURRENT_TIME);
+                wm_state->flags &= ~WM_STATE_FLAG_MOVE_WINDOW;
+                write_log("Clearing window move state.\n");
+            }
+            break;
+    }
+}
+
+void handle_xcb_motion_notify(struct ev_loop *l, xcb_motion_notify_event_t *ev) {
+    WMState *         wm_state = get_wm_state(l);
+    xcb_connection_t *conn     = wm_state->conn;
+
+    int16_t delta_x = ev->root_x - wm_state->start_x;
+    int16_t delta_y = ev->root_y - wm_state->start_y;
+
+    int16_t x = wm_state->win_origin_x + delta_x;
+    int16_t y = wm_state->win_origin_y + delta_y;
+
+    // TODO: constrain to boundaries
+    uint32_t values[2] = {(uint32_t)MAX(1, x), (uint32_t)MAX(1, y)};
+    xcb_configure_window(conn, ev->child, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, values);
 }
 
 #define IGNORE_XCB_EVENT(EVENT)                    \
@@ -117,10 +209,19 @@ void handle_xcb_button_press(struct ev_loop *l, xcb_button_press_event_t *ev) {
         write_log("Ignoring " #EVENT " event.\n"); \
         break;
 
-#define DISPATCH_XCB_EVENT(EVENT, TYPE, HANDLER) \
-    case EVENT:                                            \
-        write_log("Dispatching " #EVENT " event.\n");      \
-        HANDLER(l, (TYPE *)ev);                            \
+#define IGNORE_XCB_EVENT_SILENTLY(EVENT) \
+    case EVENT:                          \
+        break;
+
+#define DISPATCH_XCB_EVENT(EVENT, TYPE, HANDLER)      \
+    case EVENT:                                       \
+        write_log("Dispatching " #EVENT " event.\n"); \
+        HANDLER(l, (TYPE *)ev);                       \
+        break;
+
+#define DISPATCH_XCB_EVENT_SILENTLY(EVENT, TYPE, HANDLER) \
+    case EVENT:                                           \
+        HANDLER(l, (TYPE *)ev);                           \
         break;
 
 void handle_xcb_event(struct ev_loop *l, int type, xcb_generic_event_t *ev) {
@@ -130,9 +231,9 @@ void handle_xcb_event(struct ev_loop *l, int type, xcb_generic_event_t *ev) {
         IGNORE_XCB_EVENT(XCB_KEY_RELEASE)
 
         DISPATCH_XCB_EVENT(XCB_BUTTON_PRESS, xcb_button_press_event_t, handle_xcb_button_press)
+        DISPATCH_XCB_EVENT(XCB_BUTTON_RELEASE, xcb_button_release_event_t, handle_xcb_button_release)
+        DISPATCH_XCB_EVENT_SILENTLY(XCB_MOTION_NOTIFY, xcb_motion_notify_event_t, handle_xcb_motion_notify)
 
-        IGNORE_XCB_EVENT(XCB_BUTTON_RELEASE)
-        IGNORE_XCB_EVENT(XCB_MOTION_NOTIFY)
         IGNORE_XCB_EVENT(XCB_ENTER_NOTIFY)
         IGNORE_XCB_EVENT(XCB_LEAVE_NOTIFY)
         IGNORE_XCB_EVENT(XCB_FOCUS_IN)
@@ -150,7 +251,7 @@ void handle_xcb_event(struct ev_loop *l, int type, xcb_generic_event_t *ev) {
         DISPATCH_XCB_EVENT(XCB_MAP_REQUEST, xcb_map_request_event_t, handle_xcb_map_request)
 
         IGNORE_XCB_EVENT(XCB_REPARENT_NOTIFY)
-        IGNORE_XCB_EVENT(XCB_CONFIGURE_NOTIFY)
+        IGNORE_XCB_EVENT_SILENTLY(XCB_CONFIGURE_NOTIFY)
 
         DISPATCH_XCB_EVENT(XCB_CONFIGURE_REQUEST, xcb_configure_request_event_t, handle_xcb_configure_request)
 
@@ -173,7 +274,7 @@ void handle_xcb_event(struct ev_loop *l, int type, xcb_generic_event_t *ev) {
 }
 
 void handle_xcb_socket_read(struct ev_loop *l, ev_io *w, int revents) {
-    write_log("Draining xcb events.\n");
+//    write_log("Draining xcb events.\n");
 
     xcb_connection_t *   conn = get_wm_state(l)->conn;
     xcb_generic_event_t *event;
@@ -210,7 +311,7 @@ int main(int argc, char *argv[]) {
     }
 
     xcb_connection_t *conn;
-
+    xcb_screen_t *screen;
     { // Install XCB event handler
         int screen_num = 0;
         conn           = xcb_connect(nullptr, &screen_num);
@@ -228,14 +329,13 @@ int main(int argc, char *argv[]) {
             xcb_screen_next(&screen_iter);
         }
 
-        xcb_screen_t *screen = screen_iter.data;
+        screen = screen_iter.data;
 
         {
             uint32_t event_mask[] = {
                 XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY |
                 XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT |
-                XCB_EVENT_MASK_PROPERTY_CHANGE |
-                XCB_EVENT_MASK_BUTTON_PRESS
+                XCB_EVENT_MASK_PROPERTY_CHANGE
             };
             xcb_void_cookie_t cookie = xcb_change_window_attributes_checked(conn,
                                                                             screen->root,
@@ -251,11 +351,22 @@ int main(int argc, char *argv[]) {
         ev_io xcb_read_watcher;
         ev_io_init(&xcb_read_watcher, handle_xcb_socket_read, xcb_get_file_descriptor(conn), EV_READ);
         ev_io_start(loop, &xcb_read_watcher);
+
+        xcb_grab_button(conn,
+                        1,
+                        screen->root,
+                        XCB_EVENT_MASK_BUTTON_PRESS,
+                        XCB_GRAB_MODE_ASYNC,
+                        XCB_GRAB_MODE_ASYNC,
+                        screen->root,
+                        XCB_NONE,
+                        XCB_BUTTON_INDEX_1,
+                        XCB_MOD_MASK_4);
     }
 
     write_log("Entering event loop.\n");
 
-    WMState state = {conn, 0};
+    WMState state = {conn, screen, 0};
     ev_set_userdata(loop, &state);
     ev_run(loop, 0);
 
