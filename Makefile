@@ -11,6 +11,7 @@ run: mywm
 	rm /tmp/mywm.log
 	touch /tmp/mywm.log
 	tail -f /tmp/mywm.log &
+	sleep 1
 	DISPLAY=:3 sxhkd &
 	DISPLAY=:3 ./$<
 

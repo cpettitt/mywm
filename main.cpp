@@ -204,6 +204,13 @@ void handle_xcb_motion_notify(struct ev_loop *l, xcb_motion_notify_event_t *ev) 
     xcb_configure_window(conn, ev->child, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, values);
 }
 
+void handle_xcb_enter_notify(struct ev_loop *l, xcb_enter_notify_event_t *ev) {
+    xcb_set_input_focus(get_wm_state(l)->conn, XCB_INPUT_FOCUS_POINTER_ROOT, ev->event, XCB_CURRENT_TIME);
+
+    uint32_t values[] = { XCB_STACK_MODE_ABOVE };
+    xcb_configure_window(get_wm_state(l)->conn, ev->event, XCB_CONFIG_WINDOW_STACK_MODE, values);
+}
+
 #define IGNORE_XCB_EVENT(EVENT)                    \
     case EVENT:                                    \
         write_log("Ignoring " #EVENT " event.\n"); \
@@ -233,8 +240,8 @@ void handle_xcb_event(struct ev_loop *l, int type, xcb_generic_event_t *ev) {
         DISPATCH_XCB_EVENT(XCB_BUTTON_PRESS, xcb_button_press_event_t, handle_xcb_button_press)
         DISPATCH_XCB_EVENT(XCB_BUTTON_RELEASE, xcb_button_release_event_t, handle_xcb_button_release)
         DISPATCH_XCB_EVENT_SILENTLY(XCB_MOTION_NOTIFY, xcb_motion_notify_event_t, handle_xcb_motion_notify)
+        DISPATCH_XCB_EVENT(XCB_ENTER_NOTIFY, xcb_enter_notify_event_t, handle_xcb_enter_notify)
 
-        IGNORE_XCB_EVENT(XCB_ENTER_NOTIFY)
         IGNORE_XCB_EVENT(XCB_LEAVE_NOTIFY)
         IGNORE_XCB_EVENT(XCB_FOCUS_IN)
         IGNORE_XCB_EVENT(XCB_FOCUS_OUT)
